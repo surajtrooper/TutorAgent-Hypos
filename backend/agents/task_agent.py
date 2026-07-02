@@ -1,309 +1,233 @@
 """
 agents/task_agent.py
 ────────────────────
-LangGraph agent that generates a daily learning task for a student.
+TRUE ReAct Agent — Task Generation.
 
-Graph nodes (executed in order):
-    fetch_roadmap   → get the current week's topic based on roadmap date offset
-    recall_memory   → cognee.recall() to check what the student struggled with recently
-                      (if a weak topic is found, override today's topic for revision)
-    generate_task   → call Groq to generate a resource + 5 MCQ questions
-    save_task       → store the generated task in the daily_tasks collection
+Architecture change from previous version:
+  BEFORE: Fixed LangGraph pipeline (fetch → recall → generate → save).
+          LLM only called once, at the "generate" node. All routing is
+          hardcoded Python. LLM has zero agency.
 
-State:
-{
-  student_id: str,
-  date: str,              # "YYYY-MM-DD"
-  topic: str,             # today's topic
-  task: dict,             # generated task content
-  error: str | None
-}
+  NOW:    LangGraph create_react_agent() with 4 registered tools.
+          The LLM receives a system prompt describing its goal, then
+          decides on its own:
+            1. Which tools to call (fetch_today_topic, check_weak_topics,
+               get_topic_prerequisites, save_daily_task)
+            2. In what order
+            3. How many times
+            4. When it has gathered enough context to generate the quiz
+          The LLM's tool call trace is visible in logs — showing real
+          agentic reasoning.
+
+Tools available to the LLM:
+  fetch_today_topic       → DB: determine today's scheduled roadmap topic
+  check_weak_topics       → Cognee: find recent struggles (may override topic)
+  get_topic_prerequisites → Cognee ontology: find prereq/related topics
+  save_daily_task         → DB: persist the final generated task
+
+Entrypoint:
+  result = await run_task_agent(student_id, date)
+  # returns dict: { resource, questions, task_id }
 """
 
+import json
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Optional
 
-from bson import ObjectId
-from langgraph.graph import END, StateGraph
-from typing_extensions import TypedDict
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_agent
 
-from db.mongo import get_db
-from services.cognee_service import recall, recall_topic_prerequisites
-from services.llm_service import chat_json
+from agents.tools.llm_factory import get_agent_llm
+from agents.tools.task_tools import (
+    check_weak_topics,
+    fetch_today_topic,
+    get_topic_prerequisites,
+    save_daily_task,
+)
 
 logger = logging.getLogger(__name__)
 
+# ── System prompt ─────────────────────────────────────────────────────────────
 
-# ── LangGraph State ───────────────────────────────────────────────────────────
+TASK_AGENT_SYSTEM = """\
+You are an intelligent AI tutor agent for TrackMind, a personalised learning platform.
 
-class TaskState(TypedDict):
-    student_id: str
-    date: str
-    topic: str
-    task: dict
-    error: Optional[str]
+Your job is to generate a daily learning task (reading resource + 5 MCQs) for a student.
 
+You have access to these tools — USE THEM IN THIS ORDER:
 
-# ── Node 1: fetch_roadmap ─────────────────────────────────────────────────────
+1. fetch_today_topic(student_id)
+   → Find out what topic is scheduled for today based on the student's roadmap.
 
-async def fetch_roadmap(state: TaskState) -> TaskState:
-    """Determine today's topic based on the student's 12-week roadmap."""
-    logger.info("[task_agent] fetch_roadmap | student=%s", state["student_id"])
-    db = get_db()
+2. check_weak_topics(student_id)
+   → Check the student's memory graph for recent struggles.
+   → If a weak topic is found, OVERRIDE today's topic with a revision session on that topic.
+   → This is the most important personalisation step.
 
-    try:
-        # Fetch student's roadmap
-        roadmap = await db.roadmaps.find_one({"student_id": state["student_id"]})
-        if not roadmap:
-            # Fallback topic if no roadmap generated yet
-            logger.warning("[task_agent] No roadmap found for student. Using fallback topic 'CS Fundamentals'")
-            return {**state, "topic": "CS Fundamentals"}
+3. get_topic_prerequisites(topic)
+   → Look up the CS knowledge graph for prerequisite and related topics.
+   → Use this to add 1-2 bridging questions that test foundational concepts.
 
-        # Calculate week offset
-        gen_at = roadmap.get("generated_at")
-        if not gen_at:
-            gen_at = datetime.now(timezone.utc)
-        elif gen_at.tzinfo is None:
-            gen_at = gen_at.replace(tzinfo=timezone.utc)
+4. Generate the task yourself (no tool needed):
+   → Write a ~300-word reading resource explaining the topic clearly.
+   → Write exactly 5 MCQs ranging from easy to hard.
+   → Include 1-2 questions testing prerequisite concepts from step 3.
+   → Return the complete task as a JSON object with keys "resource" and "questions".
 
-        now = datetime.now(timezone.utc)
-        days_diff = (now - gen_at).days
-        week_num = (days_diff // 7) + 1
-        week_num = max(1, min(12, week_num))  # Cap between 1 and 12
+5. save_daily_task(student_id, date, topic, task_json)
+   → Persist the generated task. Pass the full JSON string as task_json.
 
-        # Find the week plan
-        weeks = roadmap.get("weeks", [])
-        week_plan = next((w for w in weeks if w.get("week") == week_num), None)
-        if not week_plan or not week_plan.get("topics"):
-            # Fallback if week index is missing
-            week_plan = weeks[0] if weeks else {"topics": ["CS Fundamentals"]}
+After saving, output ONLY the final task JSON. Do not add any explanation.
 
-        topics = week_plan.get("topics", ["CS Fundamentals"])
-        # Select topic deterministically using day offset
-        topic_index = days_diff % len(topics)
-        selected_topic = topics[topic_index]
-
-        logger.info("[task_agent] Selected topic from roadmap: week=%d, topic='%s'", week_num, selected_topic)
-        return {**state, "topic": selected_topic}
-
-    except Exception as exc:
-        logger.error("[task_agent] fetch_roadmap error: %s", exc)
-        return {**state, "error": str(exc)}
-
-
-# ── Node 2: recall_memory ─────────────────────────────────────────────────────
-
-async def recall_memory(state: TaskState) -> TaskState:
-    """Recall what topics the student has struggled with recently via Cognee."""
-    if state.get("error"):
-        return state
-
-    student_id = state["student_id"]
-    logger.info("[task_agent] recall_memory | student=%s", student_id)
-
-    try:
-        # Search for struggles or weak areas
-        memory_result = await recall(student_id, "what has student struggled with recently, weak topics")
-        if not memory_result:
-            return state
-
-        # Call LLM to quickly parse the memory and extract a specific revision topic if relevant
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a parser. Analyze the memory query results and determine if there is a specific technical topic "
-                    "the student has struggled with recently that needs revision. "
-                    "Return ONLY valid JSON. No markdown, no explanation."
-                )
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Memory Query Results:\n{memory_result}\n\n"
-                    "If a clear weak topic is found, return {\"weak_topic\": \"<topic_name>\"}. "
-                    "If no clear weak topic is found, return {\"weak_topic\": null}."
-                )
-            }
-        ]
-
-        parsed = await chat_json(prompt)
-        weak_topic = parsed.get("weak_topic")
-
-        if weak_topic:
-            logger.info("[task_agent] Overriding topic '%s' with weak topic '%s' for revision", state["topic"], weak_topic)
-            return {**state, "topic": f"Revision: {weak_topic}"}
-
-        return state
-
-    except Exception as exc:
-        logger.error("[task_agent] recall_memory error: %s", exc)
-        # Continue with roadmap topic if memory recall fails
-        return state
-
-
-# ── Node 3: generate_task ─────────────────────────────────────────────────────
-
-async def generate_task(state: TaskState) -> TaskState:
-    """Generate the study resource and 5 MCQs using Groq, enriched with Cognee ontology context."""
-    if state.get("error"):
-        return state
-
-    topic = state["topic"]
-    logger.info("[task_agent] generate_task | topic='%s'", topic)
-
-    # ── Enrich with CS ontology (prerequisite/relationship graph) ─────────────
-    # Query the shared Cognee ontology dataset to find prerequisite and related
-    # topics. This means the quiz is aware of what the student should already
-    # know, and can include bridging questions that connect concepts.
-    prerequisite_context = ""
-    try:
-        prereqs = await recall_topic_prerequisites(topic)
-        if prereqs:
-            prerequisite_context = (
-                f"\nTopic relationship context from knowledge graph:\n{prereqs}\n"
-                "Use this to include 1-2 bridging questions that test prerequisite knowledge."
-            )
-            logger.info("[task_agent] Ontology context retrieved for topic '%s'", topic)
-    except Exception as exc:
-        logger.warning("[task_agent] Ontology recall failed (non-fatal): %s", exc)
-
-    system_prompt = (
-        "You are an expert tutor. Your task is to generate a comprehensive daily learning resource "
-        "and a set of 5 multiple choice questions to test understanding of the topic.\n"
-        "Return ONLY valid JSON. No markdown, no backticks, no explanation."
-    )
-
-    user_prompt = f"""
-Generate a daily task for the topic: "{topic}".
-{prerequisite_context}
-Your response must contain:
-1. A resource with a clear title and a ~300 word detailed, high-quality, conceptual explanation of the topic.
-2. A set of exactly 5 multiple choice questions (MCQ) testing different difficulty levels (easy to hard).
-3. Each question must have exactly 4 options.
-4. Each question must have a 'correct_index' (0 to 3) indicating the zero-indexed position of the correct answer.
-
-Return this exact JSON structure:
-{{
-  "resource": {{
-    "title": "Clear Topic Title",
-    "content": "Detailed ~300-word explanation of the topic..."
-  }},
+JSON format for the task:
+{
+  "resource": {
+    "title": "Topic Title",
+    "content": "~300 word explanation..."
+  },
   "questions": [
-    {{
-      "question": "Question text here?",
-      "options": ["Option A", "Option B", "Option C", "Option D"],
+    {
+      "question": "Question text?",
+      "options": ["A", "B", "C", "D"],
       "correct_index": 0
-    }},
-    ...4 more questions...
+    }
   ]
-}}
+}
 """
 
-    try:
-        task_data = await chat_json([
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ])
 
-        # Validate structure
-        if "resource" not in task_data or "questions" not in task_data:
-            return {**state, "error": "Generated task is missing resource or questions."}
-        if len(task_data.get("questions", [])) != 5:
-            return {**state, "error": f"Generated {len(task_data.get('questions', []))} questions, expected 5."}
+# ── Agent construction ────────────────────────────────────────────────────────
 
-        return {**state, "task": task_data}
+def _build_task_agent():
+    """Build and cache the ReAct agent with all task tools registered."""
+    llm   = get_agent_llm()
+    tools = [fetch_today_topic, check_weak_topics, get_topic_prerequisites, save_daily_task]
 
-    except Exception as exc:
-        logger.error("[task_agent] generate_task error: %s", exc)
-        return {**state, "error": str(exc)}
+    # create_agent wires up:
+    #   ToolNode (executes tool calls)  ←→  LLM (decides which tools to call)
+    # The LLM loops until it stops calling tools (signals it's done reasoning).
+    agent = create_agent(llm, tools)
+    logger.info("[task_agent] ReAct agent built with %d tools: %s", len(tools), [t.name for t in tools])
+    return agent
 
 
-# ── Node 4: save_task ─────────────────────────────────────────────────────────
+_agent = _build_task_agent()
 
-async def save_task(state: TaskState) -> TaskState:
-    """Save the generated task to MongoDB daily_tasks collection."""
-    if state.get("error"):
-        return state
 
-    logger.info("[task_agent] save_task | student=%s | date=%s", state["student_id"], state["date"])
-    db = get_db()
+# ── Output parser ─────────────────────────────────────────────────────────────
 
-    doc = {
-        "student_id": state["student_id"],
-        "date": state["date"],
-        "topic": state["topic"],
-        "resource": state["task"]["resource"],
-        "questions": state["task"]["questions"],
-        "submitted": False,
-        "score": None,
-        "struggled": False
-    }
+def _extract_task_json(content: str) -> dict:
+    """
+    Extract the task JSON from the agent's final message content.
+    Handles cases where the LLM wraps JSON in markdown fences.
+    """
+    # Strip markdown code fences if present
+    content = re.sub(r"```(?:json)?\s*", "", content).strip().rstrip("`").strip()
 
     try:
-        # Upsert by student_id and date
-        result = await db.daily_tasks.update_one(
-            {"student_id": state["student_id"], "date": state["date"]},
-            {"$set": doc},
-            upsert=True
-        )
-        if result.upserted_id:
-            state["task"]["task_id"] = str(result.upserted_id)
-        else:
-            existing = await db.daily_tasks.find_one({"student_id": state["student_id"], "date": state["date"]})
-            if existing:
-                state["task"]["task_id"] = str(existing["_id"])
-        
-        return state
-
-    except Exception as exc:
-        logger.error("[task_agent] save_task error: %s", exc)
-        return {**state, "error": str(exc)}
-
-
-# ── Build graph ───────────────────────────────────────────────────────────────
-
-def _build_graph() -> object:
-    g = StateGraph(TaskState)
-
-    g.add_node("fetch_roadmap", fetch_roadmap)
-    g.add_node("recall_memory", recall_memory)
-    g.add_node("generate_task", generate_task)
-    g.add_node("save_task",     save_task)
-
-    g.set_entry_point("fetch_roadmap")
-    g.add_edge("fetch_roadmap", "recall_memory")
-    g.add_edge("recall_memory", "generate_task")
-    g.add_edge("generate_task", "save_task")
-    g.add_edge("save_task",     END)
-
-    return g.compile()
-
-
-_graph = _build_graph()
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Try to find a JSON block inside the text
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise ValueError(f"Could not extract valid JSON from agent response: {content[:300]}")
 
 
 # ── Public entrypoint ─────────────────────────────────────────────────────────
 
 async def run_task_agent(student_id: str, date: str) -> dict:
     """
-    Run the task generation pipeline.
+    Run the true ReAct task generation agent.
+
+    The LLM will:
+      - Call fetch_today_topic to get today's scheduled topic
+      - Call check_weak_topics to check Cognee for revision needs
+      - Optionally override the topic if a weak area is detected
+      - Call get_topic_prerequisites to enrich quiz context from the ontology graph
+      - Generate the full task (resource + 5 MCQs) using its own reasoning
+      - Call save_daily_task to persist to MongoDB
 
     Returns:
-        The generated task dict containing resource, questions, and task_id.
+        dict with keys: resource (dict), questions (list), task_id (str)
+
+    Raises:
+        ValueError: if the agent fails to produce a valid task
     """
-    initial: TaskState = {
-        "student_id": student_id,
-        "date": date,
-        "topic": "",
-        "task": {},
-        "error": None
-    }
+    logger.info("[task_agent] Starting ReAct agent | student=%s | date=%s", student_id, date)
 
-    final: TaskState = await _graph.ainvoke(initial)
+    user_message = (
+        f"Generate today's daily learning task for student with ID: {student_id}\n"
+        f"Today's date: {date}\n\n"
+        f"Follow your tool usage instructions exactly."
+    )
 
-    if final.get("error"):
-        raise ValueError(final["error"])
+    try:
+        result = await _agent.ainvoke({
+            "messages": [
+                SystemMessage(content=TASK_AGENT_SYSTEM),
+                HumanMessage(content=user_message),
+            ]
+        })
 
-    return final["task"]
+        # The agent returns a list of messages; the last is the final LLM response
+        messages = result.get("messages", [])
+        if not messages:
+            raise ValueError("Agent returned no messages.")
+
+        final_message = messages[-1]
+        content = (
+            final_message.content
+            if isinstance(final_message.content, str)
+            else str(final_message.content)
+        )
+
+        logger.info("[task_agent] Agent completed | messages=%d", len(messages))
+
+        # Log the tool call trace for observability
+        tool_calls_made = [
+            m.tool_calls[0]["name"]
+            for m in messages
+            if hasattr(m, "tool_calls") and m.tool_calls
+        ]
+        logger.info("[task_agent] Tool call trace: %s", " → ".join(tool_calls_made))
+
+        # Extract the structured task JSON
+        task_data = _extract_task_json(content)
+
+        # Validate structure
+        if "resource" not in task_data or "questions" not in task_data:
+            raise ValueError(f"Agent output missing 'resource' or 'questions'. Got: {list(task_data.keys())}")
+        if len(task_data.get("questions", [])) != 5:
+            raise ValueError(
+                f"Expected 5 questions, got {len(task_data.get('questions', []))}."
+            )
+
+        # Attach task_id from the save_daily_task tool call result if present
+        save_results = [
+            m.content for m in messages
+            if hasattr(m, "name") and m.name == "save_daily_task"
+        ]
+        task_id = None
+        if save_results:
+            try:
+                save_data = json.loads(save_results[-1])
+                task_id   = save_data.get("task_id")
+            except Exception:
+                pass
+
+        # Fallback: fetch task_id from DB if tool result didn't contain it
+        if not task_id:
+            from db.mongo import get_db
+            db      = get_db()
+            doc     = await db.daily_tasks.find_one({"student_id": student_id, "date": date})
+            task_id = str(doc["_id"]) if doc else None
+
+        task_data["task_id"] = task_id
+        logger.info("[task_agent] Task generated successfully | task_id=%s", task_id)
+        return task_data
+
+    except Exception as exc:
+        logger.error("[task_agent] ReAct agent failed: %s", exc)
+        raise ValueError(f"Task agent failed: {exc}") from exc

@@ -1,289 +1,219 @@
 """
 agents/roadmap_agent.py
-────────────────────────
-LangGraph agent that generates a personalised 12-week learning roadmap.
+───────────────────────
+TRUE ReAct Agent — Roadmap Generation.
 
-Graph nodes (executed in order):
-    fetch_profile   → pull student document from MongoDB
-    recall_memory   → cognee.recall() any prior context for this student
-    generate_roadmap → call Groq (JSON mode) to build the weekly plan
-    save_to_mongo   → upsert into the roadmaps collection
-    save_to_cognee  → store roadmap summary in student's memory graph
+Architecture change from previous version:
+  BEFORE: Fixed LangGraph pipeline (fetch_profile → recall_memory →
+          generate_roadmap → save_to_mongo → save_to_cognee).
+          LLM only called once, hardcoded sequence, zero LLM agency.
+
+  NOW:    LangGraph create_react_agent() with 4 registered tools.
+          The LLM decides which tools to call and when:
+            1. fetch_student_profile    → understand who the student is
+            2. recall_student_context   → remember prior history from Cognee
+            3. (generates roadmap internally using its reasoning)
+            4. save_roadmap_to_db       → persist to MongoDB
+            5. save_roadmap_to_memory   → write to Cognee knowledge graph
+
+Tools registered:
+  fetch_student_profile  → MongoDB: pull student document with goal weights
+  recall_student_context → Cognee: multi-hop graph recall + ontology context
+  save_roadmap_to_db     → MongoDB: upsert the 12-week plan
+  save_roadmap_to_memory → Cognee: store roadmap as typed graph entities
 
 Entrypoint:
-    result = await run_roadmap_agent(student_id)
-    # returns the roadmap dict on success, raises on error
+  result = await run_roadmap_agent(student_id)
+  # returns { "weeks": [...] }
 """
 
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+import re
 
-from bson import ObjectId
-from langgraph.graph import END, StateGraph
-from typing_extensions import TypedDict
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
 
-from db.mongo import get_db
-from services.cognee_service import remember_roadmap
-from services.llm_service import chat_json
+from agents.tools.llm_factory import get_agent_llm
+from agents.tools.roadmap_tools import (
+    fetch_student_profile,
+    recall_student_context,
+    save_roadmap_to_db,
+    save_roadmap_to_memory,
+)
 
 logger = logging.getLogger(__name__)
 
-# ── Goal → topic weight mapping ───────────────────────────────────────────────
-GOAL_WEIGHTS: dict[str, dict] = {
-    "FAANG": {
-        "description": "targeting FAANG / top-tier tech companies",
-        "distribution": "60% DSA & Algorithms, 20% System Design, 20% Projects & CS Fundamentals",
-        "focus_areas": ["DSA", "System Design", "Projects", "CS Fundamentals"],
-    },
-    "Startup": {
-        "description": "targeting early-stage startup roles",
-        "distribution": "40% Web/App Development, 30% DSA, 30% Projects & Product Thinking",
-        "focus_areas": ["Web/App Development", "DSA", "Projects", "Product Thinking"],
-    },
-    "MS Abroad": {
-        "description": "targeting Masters programs abroad",
-        "distribution": "40% DSA, 30% Research/ML Fundamentals, 30% Projects & Publications",
-        "focus_areas": ["DSA", "Machine Learning", "Research Projects", "Math Foundations"],
-    },
-    "Govt": {
-        "description": "targeting government / PSU competitive exams",
-        "distribution": "60% Aptitude & Reasoning, 20% CS Fundamentals, 20% DSA",
-        "focus_areas": ["Aptitude", "Reasoning", "CS Fundamentals", "DSA"],
-    },
-    "Freelance": {
-        "description": "targeting freelance / independent development work",
-        "distribution": "50% Web/App Development, 30% Projects & Portfolio, 20% DSA",
-        "focus_areas": ["Web Development", "App Development", "Portfolio Projects", "DSA"],
-    },
-}
 
+# ── System prompt ─────────────────────────────────────────────────────────────
 
-# ── LangGraph State ───────────────────────────────────────────────────────────
+ROADMAP_AGENT_SYSTEM = """\
+You are an expert academic advisor and AI agent for TrackMind, a personalised
+learning platform for college students.
 
-class RoadmapState(TypedDict):
-    student_id: str
-    profile: dict
-    memory_context: str
-    roadmap: dict          # the generated 12-week plan
-    error: Optional[str]
+Your job is to create a personalised 12-week learning roadmap for a student.
 
+You have access to these tools — USE THEM IN THIS ORDER:
 
-# ── Node 1: fetch_profile ─────────────────────────────────────────────────────
+1. fetch_student_profile(student_id)
+   → Retrieve the student's name, year, goal, target role, skills, and goal weights.
+   → You MUST call this first.
 
-async def fetch_profile(state: RoadmapState) -> RoadmapState:
-    """Pull the student document from MongoDB."""
-    logger.info("[roadmap_agent] fetch_profile | student=%s", state["student_id"])
-    db = get_db()
+2. recall_student_context(student_id)
+   → Query the student's Cognee knowledge graph for prior history:
+     mastered topics, weak areas, previous roadmap, quiz performance.
+   → Also retrieves CS topic prerequisite relationships from the shared ontology.
+   → Use this context to SKIP basics the student already knows and to ensure
+     prerequisite topics appear before advanced ones.
 
-    try:
-        student = await db.students.find_one({"_id": ObjectId(state["student_id"])})
-        if student is None:
-            return {**state, "error": f"Student {state['student_id']} not found."}
-        # ObjectId is not JSON-serialisable — convert to str
-        student["_id"] = str(student["_id"])
-        return {**state, "profile": student}
-    except Exception as exc:
-        logger.error("[roadmap_agent] fetch_profile error: %s", exc)
-        return {**state, "error": str(exc)}
+3. Generate the 12-week roadmap yourself (no tool needed):
+   → Use the student's goal and the goal_info.distribution from their profile.
+   → Respect topic prerequisites from the ontology context.
+   → If the student already knows some topics (current_skills), skip basics.
+   → Each week must have: "week" (1-12), "focus" (area), "topics" (3-5 concrete topics).
+   → Return the roadmap as a JSON object with key "weeks".
 
+4. save_roadmap_to_db(student_id, roadmap_json)
+   → Persist the roadmap. Pass the full JSON string {"weeks": [...]} as roadmap_json.
 
-# ── Node 2: recall_memory ─────────────────────────────────────────────────────
+5. save_roadmap_to_memory(student_id, roadmap_summary)
+   → Build a compact text summary like:
+     "Week 1 [DSA]: Arrays & Two Pointers, Binary Search | Week 2 [DSA]: Recursion..."
+   → Pass this to save_roadmap_to_memory so Cognee builds graph edges.
 
-async def recall_memory(state: RoadmapState) -> RoadmapState:
-    """Ask Cognee for any prior context about this student."""
-    if state.get("error"):
-        return state
+After saving, output ONLY the final roadmap JSON. Do not add any explanation.
 
-    logger.info("[roadmap_agent] recall_memory | student=%s", state["student_id"])
-
-    from services.cognee_service import recall
-    context = await recall(
-        state["student_id"],
-        "student profile, skills, goals, previous roadmap, mastered topics, weak areas",
-        include_ontology=True,   # pull in CS prerequisite relationships to inform topic ordering
-    )
-    return {**state, "memory_context": context or ""}
-
-
-# ── Node 3: generate_roadmap ──────────────────────────────────────────────────
-
-async def generate_roadmap(state: RoadmapState) -> RoadmapState:
-    """Call Groq (JSON mode) to build the 12-week plan."""
-    if state.get("error"):
-        return state
-
-    profile = state["profile"]
-    goal = profile.get("goal", "FAANG")
-    goal_info = GOAL_WEIGHTS.get(goal, GOAL_WEIGHTS["FAANG"])
-
-    logger.info("[roadmap_agent] generate_roadmap | student=%s | goal=%s", state["student_id"], goal)
-
-    memory_section = ""
-    if state.get("memory_context"):
-        memory_section = f"\nPrevious context about this student:\n{state['memory_context']}\n"
-
-    system_prompt = (
-        "You are an expert academic advisor and technical interview coach. "
-        "Your task is to create a personalised 12-week learning roadmap for a college student. "
-        "Return ONLY valid JSON. No markdown, no backticks, no explanation."
-    )
-
-    user_prompt = f"""
-Create a 12-week personalised learning roadmap for this student:
-
-Name: {profile.get("name")}
-Year: {profile.get("year")} year of college
-Goal: {goal} — {goal_info["description"]}
-Target Role: {profile.get("target_role")}
-Current Skills: {", ".join(profile.get("current_skills", [])) or "none listed"}
-{memory_section}
-Topic Distribution: {goal_info["distribution"]}
-Focus Areas: {", ".join(goal_info["focus_areas"])}
-
-Rules:
-- Exactly 12 weeks.
-- Each week has one primary "focus" (e.g. "DSA", "System Design") and 3-5 specific "topics".
-- Topics must be concrete and actionable (e.g. "Arrays & Sliding Window", not just "Arrays").
-- Progressively increase difficulty week over week.
-- Align strongly with the student's goal and target role.
-- If the student already knows some topics (current_skills), skip basics and start intermediate.
-
-Return this exact JSON structure:
-{{
+JSON format:
+{
   "weeks": [
-    {{
+    {
       "week": 1,
       "focus": "DSA",
       "topics": ["Arrays & Two Pointers", "Binary Search", "Sliding Window", "Prefix Sums"]
-    }},
-    ...12 weeks total...
+    },
+    ... 12 weeks total ...
   ]
-}}
+}
+
+Rules:
+- Exactly 12 weeks.
+- Topics must be concrete and actionable (e.g. "Arrays & Sliding Window", not just "Arrays").
+- Progressively increase difficulty week over week.
+- Align strongly with the student's goal distribution from their profile.
+- If the student already knows some topics, start at intermediate level.
 """
 
-    try:
-        data = await chat_json([
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ])
 
-        if "weeks" not in data or not isinstance(data["weeks"], list):
-            return {**state, "error": "Model returned unexpected JSON structure."}
+# ── Agent construction ────────────────────────────────────────────────────────
 
-        # Normalise — ensure week numbers are correct
-        for i, week in enumerate(data["weeks"], start=1):
-            week["week"] = i
+def _build_roadmap_agent():
+    """Build and cache the ReAct agent with all roadmap tools registered."""
+    llm   = get_agent_llm()
+    tools = [fetch_student_profile, recall_student_context, save_roadmap_to_db, save_roadmap_to_memory]
 
-        return {**state, "roadmap": data}
-
-    except Exception as exc:
-        logger.error("[roadmap_agent] generate_roadmap error: %s", exc)
-        return {**state, "error": str(exc)}
+    agent = create_react_agent(llm, tools)
+    logger.info(
+        "[roadmap_agent] ReAct agent built with %d tools: %s",
+        len(tools), [t.name for t in tools]
+    )
+    return agent
 
 
-# ── Node 4: save_to_mongo ─────────────────────────────────────────────────────
+_agent = _build_roadmap_agent()
 
-async def save_to_mongo(state: RoadmapState) -> RoadmapState:
-    """Upsert the roadmap into the roadmaps collection."""
-    if state.get("error"):
-        return state
 
-    logger.info("[roadmap_agent] save_to_mongo | student=%s", state["student_id"])
-    db = get_db()
+# ── Output parser ─────────────────────────────────────────────────────────────
 
-    doc = {
-        "student_id": state["student_id"],
-        "weeks": state["roadmap"]["weeks"],
-        "generated_at": datetime.now(timezone.utc),
-    }
+def _extract_roadmap_json(content: str) -> dict:
+    """
+    Extract the roadmap JSON from the agent's final message.
+    Handles markdown fences and trailing text.
+    """
+    content = re.sub(r"```(?:json)?\s*", "", content).strip().rstrip("`").strip()
 
     try:
-        await db.roadmaps.update_one(
-            {"student_id": state["student_id"]},
-            {"$set": doc},
-            upsert=True,
-        )
-        logger.info("[roadmap_agent] save_to_mongo OK")
-        return state
-    except Exception as exc:
-        logger.error("[roadmap_agent] save_to_mongo error: %s", exc)
-        return {**state, "error": str(exc)}
-
-
-# ── Node 5: save_to_cognee ────────────────────────────────────────────────────
-
-async def save_to_cognee(state: RoadmapState) -> RoadmapState:
-    """Store a roadmap summary in the student's Cognee memory graph."""
-    if state.get("error"):
-        return state
-
-    logger.info("[roadmap_agent] save_to_cognee | student=%s", state["student_id"])
-
-    weeks = state["roadmap"]["weeks"]
-    # Build a compact text summary — don't dump the whole JSON into memory
-    summary_lines = [f"Week {w['week']} [{w['focus']}]: {', '.join(w['topics'])}" for w in weeks]
-    summary = " | ".join(summary_lines)
-
-    await remember_roadmap(state["student_id"], summary)
-    return state
-
-
-# ── Route helper ──────────────────────────────────────────────────────────────
-
-def _route(state: RoadmapState) -> str:
-    """Stop the graph early if any node set an error."""
-    return END if state.get("error") else "continue"
-
-
-# ── Build graph ───────────────────────────────────────────────────────────────
-
-def _build_graph() -> object:
-    g = StateGraph(RoadmapState)
-
-    g.add_node("fetch_profile",    fetch_profile)
-    g.add_node("recall_memory",    recall_memory)
-    g.add_node("generate_roadmap", generate_roadmap)
-    g.add_node("save_to_mongo",    save_to_mongo)
-    g.add_node("save_to_cognee",   save_to_cognee)
-
-    g.set_entry_point("fetch_profile")
-    g.add_edge("fetch_profile",    "recall_memory")
-    g.add_edge("recall_memory",    "generate_roadmap")
-    g.add_edge("generate_roadmap", "save_to_mongo")
-    g.add_edge("save_to_mongo",    "save_to_cognee")
-    g.add_edge("save_to_cognee",   END)
-
-    return g.compile()
-
-
-_graph = _build_graph()
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise ValueError(f"Could not extract valid JSON from agent response: {content[:300]}")
 
 
 # ── Public entrypoint ─────────────────────────────────────────────────────────
 
 async def run_roadmap_agent(student_id: str) -> dict:
     """
-    Run the full roadmap generation pipeline.
+    Run the true ReAct roadmap generation agent.
+
+    The LLM will:
+      - Call fetch_student_profile to understand the student's goal and skills
+      - Call recall_student_context to query Cognee memory + CS ontology graph
+      - Generate a 12-week roadmap with proper topic ordering and difficulty curve
+      - Call save_roadmap_to_db to persist in MongoDB
+      - Call save_roadmap_to_memory to write typed entities into Cognee graph
 
     Returns:
-        The roadmap dict  { "weeks": [...] }
+        dict with key "weeks" — list of 12 week objects
 
     Raises:
-        ValueError: if any node reports an error.
+        ValueError: if the agent fails to produce a valid roadmap
     """
-    initial: RoadmapState = {
-        "student_id": student_id,
-        "profile": {},
-        "memory_context": "",
-        "roadmap": {},
-        "error": None,
-    }
+    logger.info("[roadmap_agent] Starting ReAct agent | student=%s", student_id)
 
-    final: RoadmapState = await _graph.ainvoke(initial)
+    user_message = (
+        f"Generate a personalised 12-week learning roadmap for student ID: {student_id}\n\n"
+        f"Follow your tool usage instructions exactly. "
+        f"Make sure to use all 4 tools before returning the final roadmap."
+    )
 
-    if final.get("error"):
-        raise ValueError(final["error"])
+    try:
+        result = await _agent.ainvoke({
+            "messages": [
+                SystemMessage(content=ROADMAP_AGENT_SYSTEM),
+                HumanMessage(content=user_message),
+            ]
+        })
 
-    return final["roadmap"]
+        messages = result.get("messages", [])
+        if not messages:
+            raise ValueError("Agent returned no messages.")
+
+        final_message = messages[-1]
+        content = (
+            final_message.content
+            if isinstance(final_message.content, str)
+            else str(final_message.content)
+        )
+
+        logger.info("[roadmap_agent] Agent completed | messages=%d", len(messages))
+
+        # Log the tool call trace
+        tool_calls_made = [
+            m.tool_calls[0]["name"]
+            for m in messages
+            if hasattr(m, "tool_calls") and m.tool_calls
+        ]
+        logger.info("[roadmap_agent] Tool call trace: %s", " → ".join(tool_calls_made))
+
+        # Extract and validate the roadmap JSON
+        roadmap = _extract_roadmap_json(content)
+
+        if "weeks" not in roadmap or not isinstance(roadmap["weeks"], list):
+            raise ValueError(f"Agent output missing 'weeks'. Got: {list(roadmap.keys())}")
+
+        if len(roadmap["weeks"]) != 12:
+            logger.warning(
+                "[roadmap_agent] Expected 12 weeks, got %d. Normalising.", len(roadmap["weeks"])
+            )
+
+        # Normalise week numbers
+        for i, week in enumerate(roadmap["weeks"], start=1):
+            week["week"] = i
+
+        logger.info("[roadmap_agent] Roadmap generated successfully | weeks=%d", len(roadmap["weeks"]))
+        return roadmap
+
+    except Exception as exc:
+        logger.error("[roadmap_agent] ReAct agent failed: %s", exc)
+        raise ValueError(f"Roadmap agent failed: {exc}") from exc
