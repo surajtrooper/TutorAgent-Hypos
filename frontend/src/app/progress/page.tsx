@@ -10,15 +10,35 @@ type TopicProgress = {
   topic: string;
   attempts: number;
   best_score: number;
-  last_attempted: string;
+  last_attempted: string | null;
   weak: boolean;
+};
+
+type MemorySummary = {
+  student_profile: string | null;
+  roadmap_overview: string | null;
+  topics_mastered: string | null;
+  topics_to_revise: string | null;
+  quiz_trends: string | null;
+  interview_summary: string | null;
+  narrative: string | null;
+  raw: string;
 };
 
 type ProgressData = {
   student_id: string;
   topics: TopicProgress[];
-  memory_summary: string;
+  memory: MemorySummary;
 };
+
+const MEMORY_SECTIONS: { key: keyof MemorySummary; label: string }[] = [
+  { key: "student_profile", label: "Student Profile" },
+  { key: "roadmap_overview", label: "Roadmap Overview" },
+  { key: "topics_mastered", label: "Topics Mastered" },
+  { key: "topics_to_revise", label: "Topics To Revise" },
+  { key: "quiz_trends", label: "Quiz Trends" },
+  { key: "interview_summary", label: "Interview Summary" },
+];
 
 type Phase = "loading" | "ready" | "error";
 
@@ -143,8 +163,27 @@ export default function ProgressPage() {
                 <IconBrain className="h-4 w-4" />
                 <p className="text-sm font-semibold">Learning journey summary</p>
               </div>
-              <p className="text-sm leading-relaxed text-slate-700">{progress.memory_summary}</p>
+              <p className="whitespace-pre-line text-sm leading-relaxed text-slate-700">
+                {progress.memory.narrative ?? progress.memory.raw ?? "No summary available yet."}
+              </p>
             </div>
+
+            {MEMORY_SECTIONS.some(({ key }) => progress.memory[key]) && (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {MEMORY_SECTIONS.map(({ key, label }) => {
+                  const value = progress.memory[key];
+                  if (!value) return null;
+                  return (
+                    <div key={key} className="rounded-lg border border-emerald-100 bg-white p-3">
+                      <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        {label}
+                      </p>
+                      <p className="whitespace-pre-line text-sm text-slate-700">{value}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
             <div>
               <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -167,8 +206,9 @@ export default function ProgressPage() {
                         <p className="text-sm font-medium text-slate-900">{topic.topic}</p>
                         <p className="text-xs text-slate-500">
                           {topic.attempts} attempt{topic.attempts === 1 ? "" : "s"} · best{" "}
-                          {topic.best_score}% · last{" "}
-                          {new Date(topic.last_attempted).toLocaleDateString()}
+                          {topic.best_score}%
+                          {topic.last_attempted &&
+                            ` · last ${new Date(topic.last_attempted).toLocaleDateString()}`}
                         </p>
                       </div>
                       {topic.weak ? (
