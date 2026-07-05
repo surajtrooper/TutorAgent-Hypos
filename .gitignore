@@ -46,3 +46,4 @@ env/
 # Cognee local storage
 cognee_data/
 .cognee_system/
+!env.example

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { getCurrentStudentId, logout } from "@/lib/api";
 
@@ -31,10 +31,10 @@ export function useAuthGuard() {
   }, [studentId, router]);
 
   /** Call when an API response comes back 401 (expired/invalid token). */
-  function handleSessionExpired() {
+  const handleSessionExpired = useCallback(() => {
     logout();
     router.replace("/login");
-  }
+  }, [router]);
 
   return { studentId, ready, handleSessionExpired };
 }
